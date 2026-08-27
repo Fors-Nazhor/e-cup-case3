@@ -29,8 +29,8 @@ DATA_END = date(2026, 2, 13)
 TEST_ANCHOR = DATA_END
 
 # windows are [t - (w-1), t], i.e. w days ending on the anchor
-CORE_WINDOWS = [7, 14, 30, 60, 90, 180, 365]
-CHAN_WINDOWS = [30, 90, 365]
+CORE_WINDOWS = [1, 3, 7, 14, 30, 60, 90, 180, 365]
+CHAN_WINDOWS = [3, 7, 30, 90, 365]
 STAT_WINDOWS = [30, 90, 365]
 
 CORE_COLS = ["gmv", "to_ord", "to_cart", "searches", "is_ord_day", "is_active"]
@@ -171,6 +171,55 @@ def _derived_exprs(anchor: date) -> list[pl.Expr]:
         e.append(_safe_div(f"gmv_search_s{w}", f"search_to_ord_s{w}", f"aov_search{w}"))
         e.append(_safe_div(f"gmv_cat_s{w}", f"cat_to_ord_s{w}", f"aov_cat{w}"))
 
+    # --- hypotheses from domain-side reviewers ---
+    # Kept only where these 16 columns actually support them; the promo-,
+    # category-, favourites- and SKU-trend-based ones are not computable here.
+    for w in CORE_WINDOWS:
+        # items per ordering day. Note to_ord counts *items*, not orders, so
+        # this cannot separate a split order from one large basket -- the
+        # original framing assumed an order-level column we do not have.
+        e.append(_safe_div(f"to_ord_s{w}", f"is_ord_day_s{w}", f"basket{w}"))
+        # searching a lot and buying little
+        e.append((pl.col(f"searches_s{w}") / (pl.col(f"to_ord_s{w}") + 1.0))
+                 .alias(f"futility{w}"))
+        # cart as a wishlist: items left in the cart. Against the usual reading
+        # of abandonment as negative, a persistent surplus may mark an engaged
+        # user who keeps coming back to it.
+        e.append((pl.col(f"to_cart_s{w}") - pl.col(f"to_ord_s{w}")).alias(f"cart_surplus{w}"))
+        e.append(((pl.col(f"to_cart_s{w}") - pl.col(f"to_ord_s{w}"))
+                  / (pl.col(f"to_cart_s{w}") + 1.0)).alias(f"cart_surplus_rate{w}"))
+
+    for w in CHAN_WINDOWS:
+        # value extracted per query: spikes when someone arrives knowing exactly
+        # what they want, which is what gift buying looks like
+        e.append((pl.col(f"gmv_search_s{w}") / (pl.col(f"searches_s{w}") + 1.0))
+                 .alias(f"search_eff{w}"))
+        # per-channel funnel conversion: catalogue buying is meant to be more
+        # impulsive, search buying more deliberate
+        e.append((pl.col(f"cat_to_ord_s{w}") / (pl.col(f"cat_to_cart_s{w}") + 1.0))
+                 .alias(f"cat_conv{w}"))
+        e.append((pl.col(f"search_to_ord_s{w}") / (pl.col(f"search_to_cart_s{w}") + 1.0))
+                 .alias(f"search_conv{w}"))
+        # searching costs effort, browsing does not; this ratio falling is an
+        # early sign of disengagement
+        e.append((pl.col(f"searches_s{w}") / (pl.col(f"cat_s{w}") + 1.0))
+                 .alias(f"srch_per_cat{w}"))
+
+    # "pattern break": current channel mix against the user's own usual mix. A
+    # tree would need an interaction of four columns to build this itself.
+    for short, long in [(3, 90), (7, 90), (30, 365)]:
+        e.append((((pl.col(f"gmv_search_s{short}") + 1.0) / (pl.col(f"gmv_cat_s{short}") + 1.0))
+                  / (((pl.col(f"gmv_search_s{long}") + 1.0) / (pl.col(f"gmv_cat_s{long}") + 1.0)) + 1e-6))
+                 .alias(f"mix_break_{short}_{long}"))
+        e.append((((pl.col(f"search_to_cart_s{short}") + 1.0) / (pl.col(f"cat_to_cart_s{short}") + 1.0))
+                  / (((pl.col(f"search_to_cart_s{long}") + 1.0) / (pl.col(f"cat_to_cart_s{long}") + 1.0)) + 1e-6))
+                 .alias(f"mix_break_cart_{short}_{long}"))
+
+    # regularity of buying: a small coefficient of variation marks a metronomic
+    # buyer, a large one bursty seasonal behaviour
+    e.append(_safe_div("ord_gap_std", "ord_gap_mean", "ord_gap_cv"))
+    e.append(_safe_div("gmv_mx365", "gmv_s365", "gmv_day_conc"))
+
     # --- coverage normalisation ---
     # A 365-day window at anchor 2025-07-02 only spans the 183 days that exist,
     # so gmv_s365 averages 405 there against 1005 at the test anchor -- a 2.5x
@@ -229,6 +278,24 @@ def build_anchor(
 
     feats = hist.group_by("user_id").agg(_window_exprs())
 
+    # --- concentration of spend across the year (weak form of "holiday-only
+    # shopper"): the strong form needs a year-over-year lag, which 13.5 months
+    # of data cannot support -- measured, t = -0.13. What is measurable is how
+    # lumpy a user's spending is across 30-day buckets.
+    buckets = (
+        hist.with_columns(bucket=(pl.col("age") // 30).cast(pl.Int32))
+        .group_by(["user_id", "bucket"])
+        .agg(b_gmv=pl.col("gmv").sum(), b_ord=pl.col("to_ord").sum())
+    )
+    conc = buckets.group_by("user_id").agg(
+        conc_gmv_max=(pl.col("b_gmv").max() / (pl.col("b_gmv").sum() + 1e-6)),
+        conc_ord_max=(pl.col("b_ord").max() / (pl.col("b_ord").sum() + 1e-6)),
+        conc_gmv_std=pl.col("b_gmv").std(),
+        n_buckets_gmv=(pl.col("b_gmv") > 0).sum().cast(pl.Int32),
+        n_buckets_ord=(pl.col("b_ord") > 0).sum().cast(pl.Int32),
+    )
+    feats = feats.join(conc, on="user_id", how="left")
+
     # lifetime stats must only look at data up to the anchor, otherwise the
     # target window would leak straight into the features
     g = (
@@ -266,6 +333,45 @@ def build_anchor(
 
     out = out.with_columns(_derived_exprs(anchor))
     out = out.drop("first_date")
+
+    # --- what this user did in the same calendar window one year earlier ---
+    # The target window is [t+1, t+30]; its year-ago twin is [t-364, t-335],
+    # which lies entirely in the past relative to the anchor, so there is no
+    # leakage. Data starts 2025-01-01, so the twin is fully covered only for
+    # anchors from 2025-12-31 onwards -- including the test anchor, whose twin
+    # is 2025-02-14..2025-03-15, the gift season. `ya_cov` tells the model how
+    # much of the window actually exists, so it can discount partial ones.
+    ya_lo = anchor + timedelta(days=1 - 365)
+    ya_hi = anchor + timedelta(days=HORIZON - 365)
+    ya_cov = max(0, (min(ya_hi, DATA_END) - max(ya_lo, DATA_START)).days + 1) / HORIZON
+    if ya_cov > 0:
+        ya = (
+            df.filter(pl.col("event_date").is_between(max(ya_lo, DATA_START), ya_hi))
+            .group_by("user_id")
+            .agg(
+                ya_gmv=pl.col("gmv").sum(),
+                ya_ord=pl.col("to_ord").sum(),
+                ya_cart=pl.col("to_cart").sum(),
+                ya_days=pl.len().cast(pl.Int32),
+                ya_ord_days=pl.col("is_ord_day").sum(),
+            )
+        )
+        out = out.join(ya, on="user_id", how="left").with_columns(
+            [pl.col(c).fill_null(0.0) for c in
+             ("ya_gmv", "ya_ord", "ya_cart", "ya_days", "ya_ord_days")]
+        )
+    else:
+        out = out.with_columns(
+            [pl.lit(None, dtype=pl.Float32).alias(c) for c in
+             ("ya_gmv", "ya_ord", "ya_cart", "ya_days", "ya_ord_days")]
+        )
+    out = out.with_columns(
+        pl.lit(ya_cov, dtype=pl.Float32).alias("ya_cov"),
+        # how concentrated the user was in that window relative to their own
+        # overall level -- "does this user shop in this part of the year"
+        (pl.col("ya_gmv") / (pl.col("life_gmv") + 1e-6)).alias("ya_gmv_share"),
+        (pl.col("ya_gmv") / (pl.col("gmv_s365") + 1e-6)).alias("ya_vs_recent"),
+    )
 
     if with_target:
         t0, t1 = anchor + timedelta(days=1), anchor + timedelta(days=HORIZON)
