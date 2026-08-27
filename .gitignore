@@ -6,7 +6,6 @@
 
 # ...except our own output
 !submission.csv
-!submission_noseason.csv
 
 # Generated artefacts: features, per-model predictions, the daily tensor, logs
 work*/
