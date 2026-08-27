@@ -302,6 +302,11 @@ def main() -> None:
             elif target_ep is not None and ep == target_ep:
                 best_pe, best_ep = pe.copy(), ep
             print(msg + f" [{time.time()-t1:.0f}s]", flush=True)
+            if target_ep is not None and ep >= target_ep:
+                # the epoch to keep is already known from validation; the
+                # remaining epochs would be discarded, so stop here
+                print(f"  reached target epoch {target_ep}, stopping", flush=True)
+                break
         acc += best_pe if best_pe is not None else pe
         if yev is not None:
             print(f"seed {seed}: best epoch {best_ep} at {best_score:.5f}", flush=True)

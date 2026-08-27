@@ -117,6 +117,7 @@ def load_stack(anchors: list[date], files: dict[date, Path], ratios, base, desea
     x = np.empty((n, len(feats)), dtype=np.float32)
     y = np.empty(n, dtype=np.float64)
     w = np.empty(n, dtype=np.float32)
+    aid = np.empty(n, dtype=np.int32)      # which anchor each row came from
     newest = max(anchors)
     i = 0
     for a in anchors:
@@ -128,10 +129,11 @@ def load_stack(anchors: list[date], files: dict[date, Path], ratios, base, desea
         # anchors closer to the prediction date describe a marketplace closer to
         # the one we predict on; tau=0 disables the weighting
         w[i:i + k] = 1.0 if tau <= 0 else np.exp(-((newest - a).days) / tau)
+        aid[i:i + k] = anchors.index(a)
         i += k
         del d
     assert i == n, (i, n)
-    return x, y, w, feats
+    return x, y, w, aid, feats
 
 
 def fit_lgb(xtr, ytr_log, xva, yva_log, num_round, seed, log_every=200, wtr=None):
@@ -162,7 +164,7 @@ def fit_cat(xtr, ytr_log, xva, yva_log, num_round, seed, wtr=None):
     return m
 
 
-def fit_twopart(xtr, ytr_used, xva, yva, sval, num_round, seed, wtr=None):
+def fit_twopart(xtr, ytr_used, xva, yva, sval, num_round, seed, wtr=None, anchor_id=None):
     """P(y>0) x E[log1p(y) | y>0].
 
     Algebraically E[log1p(y)] = P(y>0) * E[log1p(y)|y>0], so this targets the
@@ -174,20 +176,41 @@ def fit_twopart(xtr, ytr_used, xva, yva, sval, num_round, seed, wtr=None):
 
     p = dict(LGB_PARAMS, seed=seed, bagging_seed=seed + 1, feature_fraction_seed=seed + 2)
     nz = ytr_used > 0
+
+    # Dividing the target by a positive scalar cannot change which targets are
+    # zero, so the de-seasonalisation that fixes the *level* leaves the
+    # *incidence* untouched. But P(y>0) relative to the recent ordering rate is
+    # 1.04-1.07 across training anchors and 0.96 at the holdout, so a classifier
+    # pooled over anchors learns "incidence rises ~5%" and applies it where it
+    # falls. Feeding each anchor's own log-odds as an init_score makes the model
+    # learn how users rank *within* an anchor, free of its base rate; scoring
+    # then happens at the pooled rate, which the level calibration handles.
+    init = None
+    if anchor_id is not None:
+        init = np.zeros(len(nz), dtype=np.float64)
+        pooled = float(nz.mean())
+        lo_pooled = np.log(pooled / (1 - pooled))
+        for a in np.unique(anchor_id):
+            m = anchor_id == a
+            pa = float(np.clip(nz[m].mean(), 1e-6, 1 - 1e-6))
+            init[m] = np.log(pa / (1 - pa)) - lo_pooled
     va_sets = {}
     if xva is not None:
         va_sets["clf"] = lgb.Dataset(xva, label=(yva > 0).astype(np.int8))
         m = yva > 0
         va_sets["reg"] = lgb.Dataset(xva[m], label=np.log1p(yva[m] / sval))
 
+    dclf = lgb.Dataset(xtr, label=nz.astype(np.int8), weight=wtr, init_score=init)
+    n_clf, n_reg = (num_round if isinstance(num_round, (list, tuple))
+                    else (num_round, num_round))
     clf = lgb.train(dict(p, objective="binary", metric="binary_logloss"),
-                    lgb.Dataset(xtr, label=nz.astype(np.int8), weight=wtr),
-                    num_boost_round=num_round,
+                    dclf,
+                    num_boost_round=n_clf,
                     valid_sets=[va_sets["clf"]] if xva is not None else [],
                     callbacks=[lgb.early_stopping(200, verbose=False)] if xva is not None else [])
     reg = lgb.train(p, lgb.Dataset(xtr[nz], label=np.log1p(ytr_used[nz]),
                                    weight=None if wtr is None else wtr[nz]),
-                    num_boost_round=num_round,
+                    num_boost_round=n_reg,
                     valid_sets=[va_sets["reg"]] if xva is not None else [],
                     callbacks=[lgb.early_stopping(200, verbose=False)] if xva is not None else [])
     return clf, reg
@@ -217,7 +240,7 @@ def run_val(args, files, ratios):
           f"-> relative {ratios[VAL_ANCHOR]/base:.4f}", flush=True)
 
     t0 = time.time()
-    xtr, ytr_used, wtr, feats = load_stack(train_anchors, files, ratios, base, args.deseason, args.tau)
+    xtr, ytr_used, wtr, atr, feats = load_stack(train_anchors, files, ratios, base, args.deseason, args.tau)
     print(f"X train {xtr.shape} ({xtr.nbytes/1e9:.2f} GB) [{time.time()-t0:.0f}s]", flush=True)
 
     va = pl.read_parquet(files[VAL_ANCHOR])
@@ -240,7 +263,8 @@ def run_val(args, files, ratios):
         s = time.time()
         print(f"\n=== {kind} ===", flush=True)
         if kind == "two":
-            m = fit_twopart(xtr, ytr_used, xva, yva, sval, args.rounds, 42, wtr=wtr)
+            m = fit_twopart(xtr, ytr_used, xva, yva, sval, args.rounds, 42,
+                            wtr=wtr, anchor_id=atr if args.incidence else None)
             iters[kind] = [int(m[0].best_iteration), int(m[1].best_iteration)]
         elif kind == "lgb":
             m = fit_lgb(xtr, ytr_log, xva, yva_log, args.rounds, 42, wtr=wtr)
@@ -253,7 +277,8 @@ def run_val(args, files, ratios):
             iters[kind] = int(m.get_best_iteration())
         lp = raw_predict(m, xva, kind)
         logs[kind] = lp
-        np.save(OUT / f"val_log_{kind}.npy", lp)
+        np.save(OUT / f"val_log_{kind}{args.tag}.npy", lp)
+        np.save(OUT / f"val_log_{kind}{args.tag}__{VAL_ANCHOR}.npy", lp)
         # headline number: predictions put back on the holdout's seasonal scale,
         # which is what the equivalent test-time pipeline will do
         scores[kind] = rmsle(yva, to_level(lp, sval))
@@ -279,6 +304,7 @@ def run_val(args, files, ratios):
         scores["blend"], iters["blend_w"] = sc, float(w)
 
     np.save(OUT / "val_y.npy", yva)
+    np.save(OUT / f"val_y__{VAL_ANCHOR}.npy", yva)
 
     OUT.mkdir(exist_ok=True, parents=True)
     json.dump({"scores": scores, "iters": iters, "season_base": base,
@@ -293,7 +319,7 @@ def run_final(args, files, ratios):
     base = float(np.mean([ratios[a] for a in train_anchors]))
     scale = TEST_SCALE if args.deseason else 1.0
     print(f"train anchors ({len(train_anchors)}):", [str(a) for a in train_anchors])
-    print(f"season base={base:.4f} test ratio={SEASON_TEST} -> prediction scale={scale:.4f}", flush=True)
+    print(f"season base={base:.4f} -> prediction scale={scale:.4f}", flush=True)
     OUT.mkdir(exist_ok=True, parents=True)
     # blend.py must reuse *this* scale: the final models see a different anchor
     # set than the validation run, so their neutral scale differs too
@@ -301,7 +327,7 @@ def run_final(args, files, ratios):
                "train_anchors": [str(a) for a in train_anchors]},
               open(OUT / "final_meta.json", "w"), indent=2)
 
-    xtr, ytr_used, wtr, feats = load_stack(train_anchors, files, ratios, base, args.deseason, args.tau)
+    xtr, ytr_used, wtr, atr, feats = load_stack(train_anchors, files, ratios, base, args.deseason, args.tau)
     ytr_log = np.log1p(ytr_used)
     print(f"X train {xtr.shape} ({xtr.nbytes/1e9:.2f} GB)", flush=True)
 
@@ -313,7 +339,10 @@ def run_final(args, files, ratios):
         # reuse the iteration counts the holdout run settled on, with a little
         # headroom because the final fit sees more anchors
         it = json.load(open(OUT / "val_report.json"))["iters"]
-        rounds_by_kind = {k: (int(max(v) * 1.15) if isinstance(v, list) else int(v * 1.15))
+        # a list means the two-part model: keep each component's own count,
+        # sharing max() trained the regressor ~50% past its optimum
+        rounds_by_kind = {k: ([int(x * 1.15) for x in v] if isinstance(v, list)
+                              else int(v * 1.15))
                           for k, v in it.items() if k in ("lgb", "cat", "two")}
         print(f"final rounds (auto, from val_report): {rounds_by_kind}", flush=True)
     elif args.final_rounds.strip().isdigit():
@@ -330,7 +359,8 @@ def run_final(args, files, ratios):
             s = time.time()
             print(f"\n=== final {kind} seed={seed} rounds={rounds} ===", flush=True)
             if kind == "two":
-                m = fit_twopart(xtr, ytr_used, None, None, 1.0, rounds, 42 + 17 * seed, wtr=wtr)
+                m = fit_twopart(xtr, ytr_used, None, None, 1.0, rounds, 42 + 17 * seed,
+                                wtr=wtr, anchor_id=atr if args.incidence else None)
             elif kind == "lgb":
                 m = fit_lgb(xtr, ytr_log, None, None, rounds, 42 + 17 * seed, wtr=wtr)
             else:
@@ -343,13 +373,18 @@ def run_final(args, files, ratios):
             print(f"done [{time.time()-s:.0f}s]", flush=True)
         # keep each model's log-space test prediction so blend.py can reweight
         # them later without refitting
-        np.save(OUT / f"test_log_{kind}.npy", per_kind / k)
+        np.save(OUT / f"test_log_{kind}{args.tag}.npy", per_kind / k)
     np.save(OUT / "test_user_id.npy", uid)
 
     pred = to_level(acc / n, scale)
     OUT.mkdir(exist_ok=True, parents=True)
     sub = pl.DataFrame({"user_id": uid, "predict": pred})
-    sub.write_csv(ROOT / "submission.csv")
+    # Never clobber a submission that is already on the leaderboard: this
+    # overwrote the live file three times in one day. Candidates get their own
+    # name; promoting one is a deliberate step (see make_submission.py).
+    out_path = ROOT / (f"submission_{os.environ.get('CASE3_WORK', 'work')}_raw.csv"
+                       if (ROOT / "submission.csv").exists() else "submission.csv")
+    sub.write_csv(out_path)
     print(f"\nwrote {ROOT/'submission.csv'} rows={sub.height}")
     print(f"pred: mean={pred.mean():.3f} median={np.median(pred):.3f} "
           f"zeros={(pred<1e-6).mean():.4f} sum={pred.sum():,.0f} max={pred.max():,.1f}")
@@ -364,6 +399,14 @@ def main() -> None:
     ap.add_argument("--models", default="lgb")
     ap.add_argument("--seeds", type=int, default=1)
     ap.add_argument("--deseason", type=int, default=1)
+    ap.add_argument("--incidence", type=int, default=1,
+                    help="per-anchor logit offset for the two-part classifier")
+    ap.add_argument("--tag", default="",
+                    help="suffix for saved predictions, so variants of the same "
+                         "model do not overwrite each other")
+    ap.add_argument("--val-anchor", default="",
+                    help="override the holdout anchor, to check that gains are "
+                         "not specific to 2026-01-14")
     ap.add_argument("--tau", type=float, default=0.0,
                     help="exponential half-life in days for anchor recency weighting; 0 = off")
     ap.add_argument("--anchor-step", type=int, default=1,
@@ -374,6 +417,11 @@ def main() -> None:
     OUT.mkdir(exist_ok=True, parents=True)
     files = anchor_files()
     ratios = season_ratios(files)
+    if args.val_anchor:
+        global VAL_ANCHOR, MAX_TRAIN_ANCHOR_FOR_VAL
+        VAL_ANCHOR = date.fromisoformat(args.val_anchor)
+        MAX_TRAIN_ANCHOR_FOR_VAL = VAL_ANCHOR - timedelta(days=HORIZON)
+        print(f"holdout overridden to {VAL_ANCHOR}", flush=True)
     print("anchors:", {str(k): round(v, 4) for k, v in sorted(ratios.items())}, flush=True)
 
     (run_val if args.mode == "val" else run_final)(args, files, ratios)

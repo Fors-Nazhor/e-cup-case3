@@ -6,6 +6,7 @@
 
 # ...except our own output
 !submission.csv
+!submission_v9.csv
 
 # Generated artefacts: features, per-model predictions, the daily tensor, logs
 work*/
@@ -19,3 +20,9 @@ tuning/BAR.txt
 .venv-rocm/
 __pycache__/
 *.pyc
+
+# Independent-audit scratch work; only the two substantive artefacts are kept
+audit/
+audit2/
+!audit/leaktest.py
+!audit2/my_approach.md
