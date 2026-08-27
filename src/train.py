@@ -1,0 +1,316 @@
+"""
+Train the LTV model for E-CUP 2026 task 3.
+
+Metric is RMSLE, so every model is fitted with plain L2 loss on log1p(target).
+That makes the training objective identical to the metric, and predictions just
+go back through expm1 with a clip at zero -- no retransformation correction.
+
+Two things beyond a plain GBDT matter here:
+
+1. Time holdout. The anchor 2026-01-14 (target 2026-01-15..2026-02-13) is never
+   used for fitting, and training anchors stop at 2025-12-15 so that no training
+   target window overlaps the holdout window.
+
+2. Anchor-level seasonality. The ratio (next 30d GMV)/(previous 30d GMV) swings
+   between 0.76 and 1.13 across anchors, and nothing in the per-user features can
+   predict it. Training labels are divided by that anchor factor so the trees fit
+   user-level signal instead of macro noise, and predictions are multiplied back
+   by the factor expected for the target window.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import json
+import time
+from datetime import date, timedelta
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+
+ROOT = Path(__file__).resolve().parent.parent
+WORK = ROOT / os.environ.get("CASE3_WORK", "work")
+OUT = ROOT / ("out" if os.environ.get("CASE3_WORK", "work") == "work"
+               else "out_" + os.environ["CASE3_WORK"])
+
+DATA_END = date(2026, 2, 13)
+TEST_ANCHOR = DATA_END
+VAL_ANCHOR = date(2026, 1, 14)
+HORIZON = 30
+MAX_TRAIN_ANCHOR_FOR_VAL = VAL_ANCHOR - timedelta(days=HORIZON)  # 2025-12-15
+
+# Expected (next 30d)/(previous 30d) GMV ratio for the test window.
+# Feb 14 - Mar 15 is a high season (Feb 23 / Mar 8); the same calendar transition
+# one year earlier ran at 16,731,754 / 14,389,481 = 1.1628. A year-over-year
+# check agrees: YoY growth is a steady ~1.43-1.50, and 1.46 x 16.73M = 24.4M
+# against a 21.0M previous window, i.e. 1.163 again.
+SEASON_TEST = 1.163
+
+DROP = {"user_id", "target", "anchor_ord"}
+
+LGB_PARAMS = dict(
+    objective="regression",
+    metric="rmse",
+    learning_rate=0.03,
+    num_leaves=255,
+    min_data_in_leaf=200,
+    feature_fraction=0.6,
+    bagging_fraction=0.8,
+    bagging_freq=1,
+    lambda_l2=5.0,
+    max_bin=255,
+    num_threads=16,
+    verbosity=-1,
+)
+
+
+def rmsle(y_true, y_pred) -> float:
+    a = np.log1p(np.clip(y_true, 0, None))
+    b = np.log1p(np.clip(y_pred, 0, None))
+    return float(np.sqrt(np.mean((a - b) ** 2)))
+
+
+def anchor_files() -> dict[date, Path]:
+    return {date.fromisoformat(p.stem.split("_")[1]): p for p in sorted(WORK.glob("anchor_*.parquet"))}
+
+
+def season_ratios(files: dict[date, Path]) -> dict[date, float]:
+    """Realised (next 30d)/(previous 30d) total-GMV ratio for every labelled anchor."""
+    out = {}
+    for a, p in files.items():
+        d = pl.read_parquet(p, columns=["gmv_s30"]) if a == TEST_ANCHOR else pl.read_parquet(p, columns=["gmv_s30", "target"])
+        if "target" not in d.columns:
+            continue
+        out[a] = float(d["target"].sum() / d["gmv_s30"].sum())
+    return out
+
+
+def load_stack(anchors: list[date], files: dict[date, Path], ratios, base, deseason, tau: float = 0.0):
+    """Stack anchors into one float32 matrix, one anchor at a time.
+
+    Concatenating the polars frames first would double peak memory, which at 40+
+    anchors is the difference between fitting in RAM and not.
+    """
+    feats = [c for c in pl.read_parquet_schema(files[anchors[0]]) if c not in DROP]
+    n = sum(250_000 for _ in anchors)
+    x = np.empty((n, len(feats)), dtype=np.float32)
+    y = np.empty(n, dtype=np.float64)
+    w = np.empty(n, dtype=np.float32)
+    newest = max(anchors)
+    i = 0
+    for a in anchors:
+        d = pl.read_parquet(files[a])
+        k = d.height
+        x[i:i + k] = d.select(feats).to_numpy()
+        ya = d["target"].to_numpy().astype(np.float64)
+        y[i:i + k] = ya / (ratios[a] / base) if deseason else ya
+        # anchors closer to the prediction date describe a marketplace closer to
+        # the one we predict on; tau=0 disables the weighting
+        w[i:i + k] = 1.0 if tau <= 0 else np.exp(-((newest - a).days) / tau)
+        i += k
+        del d
+    assert i == n, (i, n)
+    return x, y, w, feats
+
+
+def fit_lgb(xtr, ytr_log, xva, yva_log, num_round, seed, log_every=200, wtr=None):
+    import lightgbm as lgb
+
+    p = dict(LGB_PARAMS, seed=seed, bagging_seed=seed + 1, feature_fraction_seed=seed + 2,
+             data_random_seed=seed + 3)
+    dtr = lgb.Dataset(xtr, label=ytr_log, weight=wtr)
+    cbs = [lgb.log_evaluation(log_every)]
+    valid = []
+    if xva is not None:
+        valid = [lgb.Dataset(xva, label=yva_log, reference=dtr)]
+        cbs.append(lgb.early_stopping(200, verbose=True))
+    return lgb.train(p, dtr, num_boost_round=num_round, valid_sets=valid, callbacks=cbs)
+
+
+def fit_cat(xtr, ytr_log, xva, yva_log, num_round, seed, wtr=None):
+    from catboost import CatBoostRegressor, Pool
+
+    m = CatBoostRegressor(
+        loss_function="RMSE", iterations=num_round, learning_rate=0.06, depth=8,
+        l2_leaf_reg=6.0, random_seed=seed, od_type="Iter", od_wait=200,
+        thread_count=16, verbose=200, allow_writing_files=False, border_count=128,
+    )
+    tr = Pool(np.nan_to_num(xtr, nan=-999.0), ytr_log, weight=wtr)
+    va = Pool(np.nan_to_num(xva, nan=-999.0), yva_log) if xva is not None else None
+    m.fit(tr, eval_set=va, use_best_model=va is not None)
+    return m
+
+
+def raw_predict(model, x, kind: str) -> np.ndarray:
+    """Model output in log1p space."""
+    if kind == "cat":
+        return model.predict(np.nan_to_num(x, nan=-999.0))
+    return model.predict(x)
+
+
+def to_level(log_pred: np.ndarray, scale: float) -> np.ndarray:
+    return np.clip(np.expm1(log_pred), 0, None) * scale
+
+
+def run_val(args, files, ratios):
+    train_anchors = sorted(a for a in files if a <= MAX_TRAIN_ANCHOR_FOR_VAL)[::-1]
+    train_anchors = sorted(train_anchors[::args.anchor_step])
+    base = float(np.mean([ratios[a] for a in train_anchors]))
+    print(f"train anchors ({len(train_anchors)}):", [str(a) for a in train_anchors])
+    print(f"mean season ratio over train anchors = {base:.4f}")
+    print(f"val anchor {VAL_ANCHOR} realised ratio = {ratios[VAL_ANCHOR]:.4f} "
+          f"-> relative {ratios[VAL_ANCHOR]/base:.4f}", flush=True)
+
+    t0 = time.time()
+    xtr, ytr_used, wtr, feats = load_stack(train_anchors, files, ratios, base, args.deseason, args.tau)
+    print(f"X train {xtr.shape} ({xtr.nbytes/1e9:.2f} GB) [{time.time()-t0:.0f}s]", flush=True)
+
+    va = pl.read_parquet(files[VAL_ANCHOR])
+    xva = va.select(feats).to_numpy().astype(np.float32)
+    yva = va["target"].to_numpy().astype(np.float64)
+    sval = ratios[VAL_ANCHOR] / base
+
+    print(f"\nRMSLE zeros         : {rmsle(yva, np.zeros_like(yva)):.5f}")
+    print(f"RMSLE carry gmv_s30 : {rmsle(yva, va['gmv_s30'].to_numpy()):.5f}", flush=True)
+
+    ytr_log = np.log1p(ytr_used)
+    # The model predicts on the neutral seasonal scale, so early stopping has to
+    # compare against a holdout label put on that same scale. Against the raw
+    # label the constant seasonal offset inflates the error floor and stops
+    # training far too early.
+    yva_log = np.log1p(yva / sval) if args.deseason else np.log1p(yva)
+
+    logs, iters, scores = {}, {}, {}
+    for kind in args.models.split(","):
+        s = time.time()
+        print(f"\n=== {kind} ===", flush=True)
+        if kind == "lgb":
+            m = fit_lgb(xtr, ytr_log, xva, yva_log, args.rounds, 42, wtr=wtr)
+            iters[kind] = int(m.best_iteration)
+            imp = sorted(zip(feats, m.feature_importance("gain")), key=lambda z: -z[1])
+            json.dump({n: float(v) for n, v in imp}, open(OUT / "lgb_importance.json", "w"))
+            print("top 30:", ", ".join(f"{n}" for n, _ in imp[:30]))
+        else:
+            m = fit_cat(xtr, ytr_log, xva, yva_log, args.rounds, 42, wtr=wtr)
+            iters[kind] = int(m.get_best_iteration())
+        lp = raw_predict(m, xva, kind)
+        logs[kind] = lp
+        np.save(OUT / f"val_log_{kind}.npy", lp)
+        # headline number: predictions put back on the holdout's seasonal scale,
+        # which is what the equivalent test-time pipeline will do
+        scores[kind] = rmsle(yva, to_level(lp, sval))
+        scores[f"{kind}_noscale"] = rmsle(yva, to_level(lp, 1.0))
+        grid = {round(g, 3): rmsle(yva, to_level(lp, g)) for g in np.arange(0.5, 1.45, 0.02)}
+        bg = min(grid, key=grid.get)
+        print(f"{kind}: RMSLE={scores[kind]:.5f} (scale={sval:.3f}) | "
+              f"no-scale={scores[f'{kind}_noscale']:.5f} | "
+              f"best empirical scale={bg} -> {grid[bg]:.5f} | iters={iters[kind]} [{time.time()-s:.0f}s]",
+              flush=True)
+
+    if len(logs) > 1:
+        best = min(
+            ((w, rmsle(yva, to_level(w * logs["lgb"] + (1 - w) * logs["cat"], sval)))
+             for w in np.arange(0, 1.001, 0.05)), key=lambda z: z[1])
+        print(f"\nblend w_lgb={best[0]:.2f} RMSLE={best[1]:.5f}")
+        scores["blend"], iters["blend_w"] = best[1], float(best[0])
+    np.save(OUT / "val_y.npy", yva)
+
+    OUT.mkdir(exist_ok=True, parents=True)
+    json.dump({"scores": scores, "iters": iters, "season_base": base,
+               "val_ratio": ratios[VAL_ANCHOR], "deseason": args.deseason},
+              open(OUT / "val_report.json", "w"), indent=2)
+    print("\n" + json.dumps(scores, indent=2))
+
+
+def run_final(args, files, ratios):
+    train_anchors = sorted(a for a in files if a != TEST_ANCHOR)[::-1]
+    train_anchors = sorted(train_anchors[::args.anchor_step])
+    base = float(np.mean([ratios[a] for a in train_anchors]))
+    scale = (SEASON_TEST / base) if args.deseason else 1.0
+    print(f"train anchors ({len(train_anchors)}):", [str(a) for a in train_anchors])
+    print(f"season base={base:.4f} test ratio={SEASON_TEST} -> prediction scale={scale:.4f}", flush=True)
+    OUT.mkdir(exist_ok=True, parents=True)
+    # blend.py must reuse *this* scale: the final models see a different anchor
+    # set than the validation run, so their neutral scale differs too
+    json.dump({"season_base": base, "scale": scale, "season_test": SEASON_TEST,
+               "train_anchors": [str(a) for a in train_anchors]},
+              open(OUT / "final_meta.json", "w"), indent=2)
+
+    xtr, ytr_used, wtr, feats = load_stack(train_anchors, files, ratios, base, args.deseason, args.tau)
+    ytr_log = np.log1p(ytr_used)
+    print(f"X train {xtr.shape} ({xtr.nbytes/1e9:.2f} GB)", flush=True)
+
+    te = pl.read_parquet(files[TEST_ANCHOR])
+    xte = te.select(feats).to_numpy().astype(np.float32)
+    uid = te["user_id"].to_numpy()
+
+    if args.final_rounds == "auto":
+        # reuse the iteration counts the holdout run settled on, with a little
+        # headroom because the final fit sees more anchors
+        it = json.load(open(OUT / "val_report.json"))["iters"]
+        rounds_by_kind = {k: int(v * 1.15) for k, v in it.items() if k in ("lgb", "cat")}
+        print(f"final rounds (auto, from val_report): {rounds_by_kind}", flush=True)
+    elif args.final_rounds.strip().isdigit():
+        # plain integer: same round count for every requested model. Avoids
+        # passing JSON on the command line, which PowerShell 5.1 mangles.
+        rounds_by_kind = {k: int(args.final_rounds) for k in args.models.split(",")}
+    else:
+        rounds_by_kind = json.loads(args.final_rounds)
+
+    acc, n = np.zeros(len(uid)), 0
+    for kind, rounds in rounds_by_kind.items():
+        per_kind, k = np.zeros(len(uid)), 0
+        for seed in range(args.seeds):
+            s = time.time()
+            print(f"\n=== final {kind} seed={seed} rounds={rounds} ===", flush=True)
+            m = (fit_lgb(xtr, ytr_log, None, None, rounds, 42 + 17 * seed, wtr=wtr)
+                 if kind == "lgb" else
+                 fit_cat(xtr, ytr_log, None, None, rounds, 42 + 17 * seed, wtr=wtr))
+            lp = raw_predict(m, xte, kind)
+            per_kind += lp
+            acc += lp
+            n += 1
+            k += 1
+            print(f"done [{time.time()-s:.0f}s]", flush=True)
+        # keep each model's log-space test prediction so blend.py can reweight
+        # them later without refitting
+        np.save(OUT / f"test_log_{kind}.npy", per_kind / k)
+    np.save(OUT / "test_user_id.npy", uid)
+
+    pred = to_level(acc / n, scale)
+    OUT.mkdir(exist_ok=True, parents=True)
+    sub = pl.DataFrame({"user_id": uid, "predict": pred})
+    sub.write_csv(ROOT / "submission.csv")
+    print(f"\nwrote {ROOT/'submission.csv'} rows={sub.height}")
+    print(f"pred: mean={pred.mean():.3f} median={np.median(pred):.3f} "
+          f"zeros={(pred<1e-6).mean():.4f} sum={pred.sum():,.0f} max={pred.max():,.1f}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["val", "final"], default="val")
+    ap.add_argument("--rounds", type=int, default=8000)
+    ap.add_argument("--final-rounds", default="auto",
+                    help='"auto" (reuse holdout iteration counts), a plain integer, or JSON')
+    ap.add_argument("--models", default="lgb")
+    ap.add_argument("--seeds", type=int, default=1)
+    ap.add_argument("--deseason", type=int, default=1)
+    ap.add_argument("--tau", type=float, default=0.0,
+                    help="exponential half-life in days for anchor recency weighting; 0 = off")
+    ap.add_argument("--anchor-step", type=int, default=1,
+                    help="use every k-th anchor; anchors sit ~4-5 days apart, so"
+                         " k=3 restores a ~14-day stride and drops near-duplicates")
+    args = ap.parse_args()
+
+    OUT.mkdir(exist_ok=True, parents=True)
+    files = anchor_files()
+    ratios = season_ratios(files)
+    print("anchors:", {str(k): round(v, 4) for k, v in sorted(ratios.items())}, flush=True)
+
+    (run_val if args.mode == "val" else run_final)(args, files, ratios)
+
+
+if __name__ == "__main__":
+    main()

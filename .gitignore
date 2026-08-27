@@ -1,0 +1,21 @@
+# Provided by the organisers, not part of this solution
+*.parquet
+*.csv
+*.ipynb
+*.pdf
+
+# ...except our own output
+!submission.csv
+!submission_noseason.csv
+
+# Generated artefacts: features, per-model predictions, the daily tensor, logs
+work*/
+out*/
+logs/
+*.npy
+*.log
+
+# Environments
+.venv-rocm/
+__pycache__/
+*.pyc

@@ -1,0 +1,13 @@
+# CPU pipeline (feature engineering + gradient boosting)
+numpy>=2.0
+polars>=1.30
+pyarrow>=18
+lightgbm>=4.5
+catboost>=1.2
+scikit-learn>=1.5
+
+# Optional GPU branch: temporal CNN on an AMD Radeon (RDNA4 / gfx1201) via ROCm.
+# Install separately, it is not on PyPI:
+#   pip install torch --index-url https://rocm.nightlies.amd.com/v2/gfx120X-all/
+# On NVIDIA just use a normal CUDA build of torch; the code only asks for
+# torch.cuda.is_available().
