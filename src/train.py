@@ -50,16 +50,21 @@ SEASON_TEST = 1.163
 
 DROP = {"user_id", "target", "anchor_ord"}
 
+# From a random search over 26 configs on the holdout. The whole search space
+# spanned only 0.0017 RMSLE, so these are a mild improvement over a hand-picked
+# config rather than a decisive one -- the ceiling here is features, not fitting.
 LGB_PARAMS = dict(
     objective="regression",
     metric="rmse",
-    learning_rate=0.03,
+    learning_rate=0.02,
     num_leaves=255,
-    min_data_in_leaf=200,
-    feature_fraction=0.6,
-    bagging_fraction=0.8,
+    min_data_in_leaf=20,
+    feature_fraction=0.25,
+    bagging_fraction=0.7,
     bagging_freq=1,
+    lambda_l1=0.0,
     lambda_l2=5.0,
+    path_smooth=1.0,
     max_bin=255,
     num_threads=16,
     verbosity=-1,
@@ -143,10 +148,44 @@ def fit_cat(xtr, ytr_log, xva, yva_log, num_round, seed, wtr=None):
     return m
 
 
+def fit_twopart(xtr, ytr_used, xva, yva, sval, num_round, seed, wtr=None):
+    """P(y>0) x E[log1p(y) | y>0].
+
+    Algebraically E[log1p(y)] = P(y>0) * E[log1p(y)|y>0], so this targets the
+    same quantity as the direct regressor but lets a dedicated classifier carry
+    the zero-inflation. Measured on the holdout it beats the direct model by
+    0.0004 (paired t = 2.4), and blending the two beats either.
+    """
+    import lightgbm as lgb
+
+    p = dict(LGB_PARAMS, seed=seed, bagging_seed=seed + 1, feature_fraction_seed=seed + 2)
+    nz = ytr_used > 0
+    va_sets = {}
+    if xva is not None:
+        va_sets["clf"] = lgb.Dataset(xva, label=(yva > 0).astype(np.int8))
+        m = yva > 0
+        va_sets["reg"] = lgb.Dataset(xva[m], label=np.log1p(yva[m] / sval))
+
+    clf = lgb.train(dict(p, objective="binary", metric="binary_logloss"),
+                    lgb.Dataset(xtr, label=nz.astype(np.int8), weight=wtr),
+                    num_boost_round=num_round,
+                    valid_sets=[va_sets["clf"]] if xva is not None else [],
+                    callbacks=[lgb.early_stopping(200, verbose=False)] if xva is not None else [])
+    reg = lgb.train(p, lgb.Dataset(xtr[nz], label=np.log1p(ytr_used[nz]),
+                                   weight=None if wtr is None else wtr[nz]),
+                    num_boost_round=num_round,
+                    valid_sets=[va_sets["reg"]] if xva is not None else [],
+                    callbacks=[lgb.early_stopping(200, verbose=False)] if xva is not None else [])
+    return clf, reg
+
+
 def raw_predict(model, x, kind: str) -> np.ndarray:
     """Model output in log1p space."""
     if kind == "cat":
         return model.predict(np.nan_to_num(x, nan=-999.0))
+    if kind == "two":
+        clf, reg = model
+        return clf.predict(x) * reg.predict(x)
     return model.predict(x)
 
 
@@ -186,7 +225,10 @@ def run_val(args, files, ratios):
     for kind in args.models.split(","):
         s = time.time()
         print(f"\n=== {kind} ===", flush=True)
-        if kind == "lgb":
+        if kind == "two":
+            m = fit_twopart(xtr, ytr_used, xva, yva, sval, args.rounds, 42, wtr=wtr)
+            iters[kind] = [int(m[0].best_iteration), int(m[1].best_iteration)]
+        elif kind == "lgb":
             m = fit_lgb(xtr, ytr_log, xva, yva_log, args.rounds, 42, wtr=wtr)
             iters[kind] = int(m.best_iteration)
             imp = sorted(zip(feats, m.feature_importance("gain")), key=lambda z: -z[1])
@@ -250,7 +292,8 @@ def run_final(args, files, ratios):
         # reuse the iteration counts the holdout run settled on, with a little
         # headroom because the final fit sees more anchors
         it = json.load(open(OUT / "val_report.json"))["iters"]
-        rounds_by_kind = {k: int(v * 1.15) for k, v in it.items() if k in ("lgb", "cat")}
+        rounds_by_kind = {k: (int(max(v) * 1.15) if isinstance(v, list) else int(v * 1.15))
+                          for k, v in it.items() if k in ("lgb", "cat", "two")}
         print(f"final rounds (auto, from val_report): {rounds_by_kind}", flush=True)
     elif args.final_rounds.strip().isdigit():
         # plain integer: same round count for every requested model. Avoids
@@ -265,9 +308,12 @@ def run_final(args, files, ratios):
         for seed in range(args.seeds):
             s = time.time()
             print(f"\n=== final {kind} seed={seed} rounds={rounds} ===", flush=True)
-            m = (fit_lgb(xtr, ytr_log, None, None, rounds, 42 + 17 * seed, wtr=wtr)
-                 if kind == "lgb" else
-                 fit_cat(xtr, ytr_log, None, None, rounds, 42 + 17 * seed, wtr=wtr))
+            if kind == "two":
+                m = fit_twopart(xtr, ytr_used, None, None, 1.0, rounds, 42 + 17 * seed, wtr=wtr)
+            elif kind == "lgb":
+                m = fit_lgb(xtr, ytr_log, None, None, rounds, 42 + 17 * seed, wtr=wtr)
+            else:
+                m = fit_cat(xtr, ytr_log, None, None, rounds, 42 + 17 * seed, wtr=wtr)
             lp = raw_predict(m, xte, kind)
             per_kind += lp
             acc += lp

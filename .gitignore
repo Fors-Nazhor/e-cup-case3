@@ -12,6 +12,7 @@
 work*/
 out*/
 logs/
+tuning/BAR.txt
 *.npy
 *.log
 

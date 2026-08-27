@@ -38,14 +38,14 @@ function Step($name, $exe, [string[]]$argv) {
 
 Log "=== pipeline start (work dir: $Work) ==="
 
-Step "1_features"    $py  @("build_features.py","--n-folds","15","--stride","14","--offsets","0,5,9")
-Step "2_daily"       $py  @("build_daily.py")
-Step "3_submission"  $py  @("train.py","--mode","final","--models","lgb","--anchor-step","3",
-                            "--deseason","1","--seeds","2","--final-rounds","220")
-Step "4_val_gbdt"    $py  @("train.py","--mode","val","--models","lgb,cat","--rounds","6000",
+if (-not (Test-Path "$root\$Worknchor_2026-02-13.parquet")) {
+    Step "1_features" $py @("build_features.py","--n-folds","15","--stride","14","--offsets","0,5,9")
+}
+if (-not (Test-Path "$root\work\daily.npy")) { Step "2_daily" $py @("build_daily.py") }
+Step "4_val_gbdt"    $py  @("train.py","--mode","val","--models","lgb,cat,two","--rounds","6000",
                             "--anchor-step","3","--tau","0","--deseason","1")
 Step "5_val_nn"      $gpu @("nn_train.py","--mode","val","--epochs","6","--anchor-step","3","--batch","4096")
-Step "6_final_gbdt"  $py  @("train.py","--mode","final","--models","lgb,cat","--anchor-step","3",
+Step "6_final_gbdt"  $py  @("train.py","--mode","final","--models","lgb,cat,two","--anchor-step","3",
                             "--tau","0","--deseason","1","--seeds","3","--final-rounds","auto")
 Step "7_final_nn"    $gpu @("nn_train.py","--mode","final","--epochs","6","--anchor-step","3","--batch","4096")
 Step "8_blend"       $py  @("blend.py")

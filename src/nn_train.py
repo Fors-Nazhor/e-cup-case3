@@ -227,9 +227,17 @@ def main() -> None:
 
     n = len(ytr)
     acc = np.zeros(de.height)
+    # in "final" mode there is no label to select on, so use the epoch count the
+    # validation run settled on rather than always running to the end
+    best_ep_path = OUT / "nn_best_epoch.json"
+    target_ep = None
+    if args.mode == "final" and best_ep_path.exists():
+        target_ep = json.load(open(best_ep_path))["best_epoch"]
+        print(f"final mode: stopping at epoch {target_ep} (from validation)", flush=True)
     for seed in range(args.seeds):
         torch.manual_seed(seed)
         np.random.seed(seed)
+        best_score, best_pe, best_ep = float("inf"), None, -1
         model = Net(n_ch, len(feats)).to(device)
         nparam = sum(p.numel() for p in model.parameters())
         print(f"\nseed {seed}: {nparam/1e6:.2f}M params", flush=True)
@@ -272,9 +280,18 @@ def main() -> None:
             msg = f"ep{ep} train_mse={run/max(cnt,1):.4f}"
             if yev is not None:
                 lvl = np.clip(np.expm1(pe), 0, None) * sev
-                msg += f" val_RMSLE={rmsle(yev, lvl):.5f}"
+                sc = rmsle(yev, lvl)
+                msg += f" val_RMSLE={sc:.5f}"
+                if sc < best_score:
+                    best_score, best_pe, best_ep = sc, pe.copy(), ep
+                    msg += "  *best*"
+            elif target_ep is not None and ep == target_ep:
+                best_pe, best_ep = pe.copy(), ep
             print(msg + f" [{time.time()-t1:.0f}s]", flush=True)
-        acc += pe
+        acc += best_pe if best_pe is not None else pe
+        if yev is not None:
+            print(f"seed {seed}: best epoch {best_ep} at {best_score:.5f}", flush=True)
+            json.dump({"best_epoch": best_ep, "rmsle": best_score}, open(best_ep_path, "w"))
 
     pe = acc / args.seeds
     OUT.mkdir(exist_ok=True, parents=True)

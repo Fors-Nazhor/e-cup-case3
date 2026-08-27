@@ -171,8 +171,27 @@ def _derived_exprs(anchor: date) -> list[pl.Expr]:
         e.append(_safe_div(f"gmv_search_s{w}", f"search_to_ord_s{w}", f"aov_search{w}"))
         e.append(_safe_div(f"gmv_cat_s{w}", f"cat_to_ord_s{w}", f"aov_cat{w}"))
 
-    # lifetime context and how much history actually exists at this anchor
+    # --- coverage normalisation ---
+    # A 365-day window at anchor 2025-07-02 only spans the 183 days that exist,
+    # so gmv_s365 averages 405 there against 1005 at the test anchor -- a 2.5x
+    # shift in the same feature. A split-based model calibrated on truncated
+    # sums then over-predicts on the full-history test anchor, which is exactly
+    # the ~12% overprediction the leaderboard exposed. Rates per available day
+    # are comparable across anchors; the raw sums stay so the model can still
+    # use absolute volume where it is meaningful.
     hist = (anchor - DATA_START).days + 1
+    for w in (180, 365):
+        cov = min(w, hist)
+        for c in CORE_COLS:
+            e.append((pl.col(f"{c}_s{w}") / cov).alias(f"{c}_r{w}"))
+    for c in CHAN_COLS:
+        cov = min(365, hist)
+        e.append((pl.col(f"{c}_s365") / cov).alias(f"{c}_r365"))
+    # lifetime aggregates grow with available history for the same reason
+    for c in ("life_gmv", "life_ord", "life_cart", "life_searches",
+              "life_days", "life_ord_days"):
+        e.append((pl.col(c) / hist).alias(f"{c}_rate"))
+
     e.append(pl.lit(hist, dtype=pl.Int32).alias("hist_days"))
     e.append(
         (pl.lit(hist) - (pl.col("first_date") - pl.lit(DATA_START)).dt.total_days())
