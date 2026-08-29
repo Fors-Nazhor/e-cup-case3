@@ -38,7 +38,7 @@ function Step($name, $exe, [string[]]$argv) {
 
 Log "=== pipeline start (work dir: $Work) ==="
 
-if (-not (Test-Path "$root\$Worknchor_2026-02-13.parquet")) {
+if (-not (Test-Path "$root\$Work\anchor_2026-02-13.parquet")) {
     Step "1_features" $py @("build_features.py","--n-folds","15","--stride","14","--offsets","0,5,9")
 }
 if (-not (Test-Path "$root\work\daily.npy")) { Step "2_daily" $py @("build_daily.py") }

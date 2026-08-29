@@ -1,0 +1,45 @@
+{
+  "work": "work9",
+  "models": "lgb,cat,two:_noincid,nn:_top150:_top150",
+  "weights": {
+    "cat": 0.0,
+    "lgb": 0.0,
+    "nn": 0.55,
+    "two": 0.45
+  },
+  "holdout_scale": 0.7252478523470913,
+  "transfer": 1.419,
+  "test_scale": 1.0291267024805226,
+  "holdout_rmsle": 1.666620569282998,
+  "own_scales": {
+    "lgb": 0.7261805538364106,
+    "cat": 0.725027846229461,
+    "two": 0.7138120703633647,
+    "nn": 0.733249384550434
+  },
+  "val_anchor": "2026-01-14",
+  "sources": {
+    "lgb": {
+      "val": "val_log_lgb__2026-01-14.npy",
+      "test": "test_log_lgb.npy",
+      "dir": "out_work9"
+    },
+    "cat": {
+      "val": "val_log_cat__2026-01-14.npy",
+      "test": "test_log_cat.npy",
+      "dir": "out_work9"
+    },
+    "two": {
+      "val": "val_log_two_noincid__2026-01-14.npy",
+      "test": "test_log_two.npy",
+      "dir": "out_work9"
+    },
+    "nn": {
+      "val": "nn_log_val_top150.npy",
+      "test": "nn_log_test_top150.npy",
+      "dir": "out_work9"
+    }
+  },
+  "n_rows": 250000,
+  "pred_sum": 11043219.843985762
+}

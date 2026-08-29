@@ -22,7 +22,8 @@ def main() -> int:
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "submission.csv"
     sub = pl.read_csv(path)
     ref = pl.read_csv(ROOT / "sample_submit.csv")
-    prev = pl.read_parquet(ROOT / os.environ.get("CASE3_WORK", "work") / "anchor_2026-02-13.parquet",
+    # work9 is the live feature set; the original work/ holds only daily.npy now
+    prev = pl.read_parquet(ROOT / os.environ.get("CASE3_WORK", "work9") / "anchor_2026-02-13.parquet",
                            columns=["user_id", "gmv_s30"])
 
     fails, warns = [], []
@@ -53,7 +54,8 @@ def main() -> int:
     carry = float(prev["gmv_s30"].sum())
     ratio = p.sum() / carry
     scale = 1.0
-    meta = ROOT / ("out" if os.environ.get("CASE3_WORK","work")=="work" else "out_"+os.environ["CASE3_WORK"]) / "final_meta.json"
+    w = os.environ.get("CASE3_WORK", "work9")
+    meta = ROOT / ("out" if w == "work" else "out_" + w) / "final_meta.json"
     if meta.exists():
         import json
         scale = json.load(open(meta))["scale"]

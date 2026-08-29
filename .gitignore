@@ -4,9 +4,21 @@
 *.ipynb
 *.pdf
 
-# ...except our own output
+# ...except our own output. The two solutions, plus the scored submissions that
+# lb_combine.py needs as inputs -- without them the fitted solution is a result
+# nobody can reproduce.
 !submission.csv
+!submission_fitted.csv
 !submission_v9.csv
+!submission_v9_opt.csv
+!submission_v9_probe092.csv
+!submission_v9_s6.csv
+!submission_v10_top150.csv
+!submission_v13_mix.csv
+!submission_v15_combo.csv
+!submission_v20_best.csv
+!probe_level.csv
+!audit6/probe_P1.csv
 
 # Generated artefacts: features, per-model predictions, the daily tensor, logs
 work*/
@@ -24,5 +36,15 @@ __pycache__/
 # Independent-audit scratch work; only the two substantive artefacts are kept
 audit/
 audit2/
+audit5/
+audit_A/
+audit_B/
 !audit/leaktest.py
 !audit2/my_approach.md
+# audit6 holds the leaderboard probes, which lb_combine.py consumes
+audit6/*
+!audit6/probe_P1.csv
+
+# Working scratch, not part of the solution
+scratch_*
+run_night.ps1
