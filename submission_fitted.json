@@ -4,18 +4,22 @@
     "submission_v9_s6.csv": 1.6499374473192272,
     "submission_v10_top150.csv": 1.6516744440801103,
     "probe_level.csv": 1.650959732162873,
-    "submission_v15_combo.csv": 1.6502417168,
-    "submission_v20_best.csv": 1.6481830314
+    "submission_v20_best.csv": 1.6481830314,
+    "probe_binned.csv": 1.6548697099,
+    "part_cat.csv": 1.651537286934749,
+    "part_nn.csv": 1.657981448999588
   },
   "weights": {
-    "submission_v9.csv": 1.7706193483584107,
-    "submission_v9_s6.csv": -0.3927104749387195,
-    "submission_v10_top150.csv": 0.23812082657266895,
-    "probe_level.csv": -1.0928115533341738,
-    "submission_v15_combo.csv": -0.20834142432588992,
-    "submission_v20_best.csv": 0.6851232776677036
+    "submission_v9.csv": 2.0126581995583566,
+    "submission_v9_s6.csv": -0.430402466533875,
+    "submission_v10_top150.csv": 0.1819073904640521,
+    "probe_level.csv": -1.3283006476547548,
+    "submission_v20_best.csv": 0.7323183688611066,
+    "probe_binned.csv": -0.08071682754054921,
+    "part_cat.csv": 0.010042778635929946,
+    "part_nn.csv": -0.09750679579026632
   },
-  "l1_norm": 4.3877269051975665,
-  "predicted_rmsle": 1.6481493300803198,
-  "span_rank": 7
+  "l1_norm": 4.87385347503889,
+  "predicted_rmsle": 1.6481052373065372,
+  "span_rank": 12
 }

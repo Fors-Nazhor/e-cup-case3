@@ -18,7 +18,11 @@
 !submission_v15_combo.csv
 !submission_v20_best.csv
 !probe_level.csv
-!audit6/probe_P1.csv
+!probe_binned.csv
+!part_lgb.csv
+!part_cat.csv
+!part_nn.csv
+!part_two.csv
 
 # Generated artefacts: features, per-model predictions, the daily tensor, logs
 work*/
@@ -41,7 +45,7 @@ audit_A/
 audit_B/
 !audit/leaktest.py
 !audit2/my_approach.md
-# audit6 holds the leaderboard probes, which lb_combine.py consumes
+# probe_P1 is kept for the record; the rest of audit6 is scratch
 audit6/*
 !audit6/probe_P1.csv
 

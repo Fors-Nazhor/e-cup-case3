@@ -187,6 +187,16 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1.5e-3)
     ap.add_argument("--anchor-step", type=int, default=1, help="use every k-th anchor")
     ap.add_argument("--seeds", type=int, default=1)
+    # Every model in this ensemble -- boosting, CatBoost, the two-part model, a
+    # binned multiclass -- reads the same 423 aggregates, and their residuals
+    # correlate at 0.997. That is a property of the input, not of the algorithms.
+    # Zeroing the tabular block leaves only the daily strip, which is the one
+    # information channel the aggregates throw away: the shape of the ramp, the
+    # rhythm of the gaps, how bursty the spending is. Such a model should be
+    # clearly worse on its own and, if the diagnosis is right, wrong in a
+    # different place.
+    ap.add_argument("--no-tab", type=int, default=0,
+                    help="zero the tabular features; train on the daily strip alone")
     ap.add_argument("--seq-len", type=int, default=180,
                     help="days of daily history fed to the conv branch")
     ap.add_argument("--tab-norm", choices=["layer", "none"], default="layer",
@@ -280,6 +290,10 @@ def main() -> None:
     xev = np.sign(xev) * np.log1p(np.abs(xev))
     xev = np.clip((xev - mu) / sd, -10, 10)
     xev = np.nan_to_num(xev, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    if args.no_tab:
+        xtr[:] = 0.0
+        xev[:] = 0.0
+        print("tabular block zeroed: the net sees only the daily strip", flush=True)
     assert np.isfinite(xev).all()
     oev = np.full(de.height, (eval_anchor - DATA_START).days + PAD, dtype=np.int32)
     uev = np.arange(de.height, dtype=np.int32)
