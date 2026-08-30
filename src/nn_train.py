@@ -58,6 +58,15 @@ SEQ_LEN = 180
 PAD = 200          # must match build_daily.PAD
 DROP = {"user_id", "target", "anchor_ord"}
 
+# Columns whose distribution at the test anchor sits outside the training range.
+# hist_days and ya_cov are constant within an anchor, so they name the anchor
+# rather than the user (hist_days is anchor_ord + 1, and anchor_ord is already
+# dropped above). The ya_* family is entirely null before 2025-12-03 -- roughly
+# three quarters of the training rows -- but fully populated at the test anchor,
+# which a standardised dense layer has no way to handle.
+DRIFT = ["hist_days", "ya_cov", "ya_gmv", "ya_ord", "ya_cart", "ya_days",
+         "ya_ord_days", "ya_gmv_share", "ya_vs_recent"]
+
 
 def rmsle(y_true, y_pred) -> float:
     return float(np.sqrt(np.mean(
@@ -81,7 +90,8 @@ class Net(nn.Module):
     shorter sequences.
     """
 
-    def __init__(self, n_ch: int, n_tab: int, width: int = 96, tab_width: int = 512):
+    def __init__(self, n_ch: int, n_tab: int, width: int = 96, tab_width: int = 512,
+                 tab_norm: str = "layer"):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv1d(n_ch, width, 5, padding=2), nn.GroupNorm(8, width), nn.GELU())
@@ -95,8 +105,15 @@ class Net(nn.Module):
         ])
         # mean over the whole window, mean over the most recent stride, and max
         self.seq_out = width * 3
+        # LayerNorm here normalises ACROSS the feature axis within one row, so a
+        # column's value after it depends on every other column in that row. The
+        # inputs are already z-scored per column upstream, which makes the layer
+        # redundant and leaves only the coupling: low-signal columns set the
+        # denominator that the informative ones get divided by. That is a
+        # plausible reason cutting 417 inputs to 150 helped the net so much
+        # while doing nothing for the trees, which have no such coupling.
         self.tab = nn.Sequential(
-            nn.LayerNorm(n_tab),
+            nn.LayerNorm(n_tab) if tab_norm == "layer" else nn.Identity(),
             nn.Linear(n_tab, tab_width), nn.GELU(), nn.Dropout(0.1),
             nn.Linear(tab_width, tab_width // 2), nn.GELU(),
         )
@@ -170,7 +187,51 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1.5e-3)
     ap.add_argument("--anchor-step", type=int, default=1, help="use every k-th anchor")
     ap.add_argument("--seeds", type=int, default=1)
+    # Every model in this ensemble -- boosting, CatBoost, the two-part model, a
+    # binned multiclass -- reads the same 423 aggregates, and their residuals
+    # correlate at 0.997. That is a property of the input, not of the algorithms.
+    # Zeroing the tabular block leaves only the daily strip, which is the one
+    # information channel the aggregates throw away: the shape of the ramp, the
+    # rhythm of the gaps, how bursty the spending is. Such a model should be
+    # clearly worse on its own and, if the diagnosis is right, wrong in a
+    # different place.
+    ap.add_argument("--no-tab", type=int, default=0,
+                    help="zero the tabular features; train on the daily strip alone")
+    ap.add_argument("--seq-len", type=int, default=180,
+                    help="days of daily history fed to the conv branch")
+    ap.add_argument("--tab-norm", choices=["layer", "none"], default="layer",
+                    help="'none' removes the cross-feature LayerNorm; inputs are "
+                         "already standardised per column")
+    ap.add_argument("--drop-drift", type=int, default=0,
+                    help="drop anchor-identifier and year-ago columns (see DRIFT)")
+    ap.add_argument("--top-feats", type=int, default=0,
+                    help="keep only the N most important features by LightGBM gain. "
+                         "The net's tabular branch adds parameters per column where a "
+                         "tree simply ignores an unhelpful one, so it overfits with a "
+                         "feature set tuned for trees: 277 columns scored 1.67010, 417 "
+                         "scored 1.68012")
+    ap.add_argument("--fixed-epoch", type=int, default=-1,
+                    help="keep this epoch instead of the best one. Selecting the "
+                         "epoch on the anchor the score is reported on is "
+                         "selection on the measurement set")
+    ap.add_argument("--val-anchor", default="",
+                    help="override the holdout anchor, for multi-anchor validation")
+    ap.add_argument("--tag", default="", help="suffix for saved predictions")
     args = ap.parse_args()
+    # The daily strip is the one input the tabular models do not have, and a
+    # residual fit on all 423 aggregates explains none of this model's error --
+    # so if anything is left, it is in the raw sequence rather than in a
+    # rearrangement of the aggregates. Doubling the context is the cheapest way
+    # to test that. PAD is 200, so 360 days still fits behind every anchor.
+    global SEQ_LEN
+    SEQ_LEN = args.seq_len
+    assert SEQ_LEN <= PAD + 180, f"strip {SEQ_LEN} runs past the tensor padding"
+
+    global VAL_ANCHOR, MAX_TRAIN_ANCHOR_FOR_VAL
+    if args.val_anchor:
+        VAL_ANCHOR = date.fromisoformat(args.val_anchor)
+        MAX_TRAIN_ANCHOR_FOR_VAL = VAL_ANCHOR - timedelta(days=HORIZON)
+        print(f"holdout overridden to {VAL_ANCHOR}", flush=True)
 
     device = dev()
     print(f"device={device}", flush=True)
@@ -196,6 +257,16 @@ def main() -> None:
     del daily_np
 
     feats = [c for c in pl.read_parquet_schema(files[train_anchors[0]]) if c not in DROP]
+    if args.drop_drift:
+        n0 = len(feats)
+        feats = [c for c in feats if c not in set(DRIFT)]
+        print(f"dropped {n0 - len(feats)} drifting columns", flush=True)
+    if args.top_feats:
+        imp_path = OUT / "lgb_importance.json"
+        assert imp_path.exists(), f"need {imp_path} to rank features"
+        ranked = [c for c in json.load(open(imp_path)) if c in feats]
+        feats = ranked[:args.top_feats]
+        print(f"restricted to top {len(feats)} features by gain", flush=True)
     t0 = time.time()
     xtr, ytr, otr, utr = load_tab(train_anchors, files, ratios, base, feats)
     print(f"tab {xtr.shape} [{time.time()-t0:.0f}s]", flush=True)
@@ -219,6 +290,10 @@ def main() -> None:
     xev = np.sign(xev) * np.log1p(np.abs(xev))
     xev = np.clip((xev - mu) / sd, -10, 10)
     xev = np.nan_to_num(xev, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    if args.no_tab:
+        xtr[:] = 0.0
+        xev[:] = 0.0
+        print("tabular block zeroed: the net sees only the daily strip", flush=True)
     assert np.isfinite(xev).all()
     oev = np.full(de.height, (eval_anchor - DATA_START).days + PAD, dtype=np.int32)
     uev = np.arange(de.height, dtype=np.int32)
@@ -244,15 +319,17 @@ def main() -> None:
     # in "final" mode there is no label to select on, so use the epoch count the
     # validation run settled on rather than always running to the end
     best_ep_path = OUT / "nn_best_epoch.json"
-    target_ep = None
-    if args.mode == "final" and best_ep_path.exists():
+    target_ep = args.fixed_epoch if args.fixed_epoch >= 0 else None
+    if target_ep is not None:
+        print(f"keeping epoch {target_ep} regardless of holdout loss", flush=True)
+    if target_ep is None and args.mode == "final" and best_ep_path.exists():
         target_ep = json.load(open(best_ep_path))["best_epoch"]
         print(f"final mode: stopping at epoch {target_ep} (from validation)", flush=True)
     for seed in range(args.seeds):
         torch.manual_seed(seed)
         np.random.seed(seed)
         best_score, best_pe, best_ep = float("inf"), None, -1
-        model = Net(n_ch, len(feats)).to(device)
+        model = Net(n_ch, len(feats), tab_norm=args.tab_norm).to(device)
         nparam = sum(p.numel() for p in model.parameters())
         print(f"\nseed {seed}: {nparam/1e6:.2f}M params", flush=True)
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
@@ -296,7 +373,10 @@ def main() -> None:
                 lvl = np.clip(np.expm1(pe), 0, None) * sev
                 sc = rmsle(yev, lvl)
                 msg += f" val_RMSLE={sc:.5f}"
-                if sc < best_score:
+                if target_ep is not None:
+                    if ep == target_ep:
+                        best_score, best_pe, best_ep = sc, pe.copy(), ep
+                elif sc < best_score:
                     best_score, best_pe, best_ep = sc, pe.copy(), ep
                     msg += "  *best*"
             elif target_ep is not None and ep == target_ep:
@@ -315,7 +395,9 @@ def main() -> None:
     pe = acc / args.seeds
     OUT.mkdir(exist_ok=True, parents=True)
     tag = "val" if args.mode == "val" else "test"
-    np.save(OUT / f"nn_log_{tag}.npy", pe)
+    np.save(OUT / f"nn_log_{tag}{args.tag}.npy", pe)
+    if args.mode == "val":
+        np.save(OUT / f"nn_log_val{args.tag}__{VAL_ANCHOR}.npy", pe)
     if yev is not None:
         lvl = np.clip(np.expm1(pe), 0, None) * sev
         print(f"\nFINAL nn {tag} RMSLE={rmsle(yev, lvl):.5f}")

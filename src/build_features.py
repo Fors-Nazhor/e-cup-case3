@@ -296,6 +296,43 @@ def build_anchor(
     )
     feats = feats.join(conc, on="user_id", how="left")
 
+    # --- plug-in estimate of the quantity the metric actually asks for.
+    # RMSLE is minimised by E[log1p(Y)], but every feature above lives in raw
+    # space, so the model has to infer the Jensen correction per user from
+    # scratch. The user's own history already contains a direct sample of it:
+    # split the lookback into whole 30-day blocks -- the same length as the
+    # target window -- and average log1p of the spend in each.
+    #
+    # Two details matter. `buckets` only holds blocks where the user did
+    # something, so a plain mean would average over active blocks only and run
+    # high; since log1p(0) = 0 the missing blocks contribute exactly zero, so
+    # summing over what is present and dividing by the number of blocks that
+    # SHOULD exist is exact. And only whole blocks count: the lookback is 365
+    # days and short histories cover fewer, so n_cov is capped per anchor.
+    hist_days = (anchor - DATA_START).days + 1
+    n_cov = max(1, min(12, hist_days // 30))
+    whole = buckets.filter(pl.col("bucket") < n_cov)
+    lg = pl.col("b_gmv").log1p()
+    wl = whole.group_by("user_id").agg(
+        _wl_sum=lg.sum(),
+        _wl_sq=(lg ** 2).sum(),
+        _wl_raw=pl.col("b_gmv").sum(),
+        _wl_hit=(pl.col("b_ord") > 0).sum(),
+    )
+    wl = wl.with_columns(
+        # mean log1p spend per 30-day block -- a direct estimate of the target
+        wl_mean=pl.col("_wl_sum") / n_cov,
+        # share of the user's own 30-day blocks containing a purchase: the
+        # plug-in for P(buys at all), which is where ~80% of the variance is
+        wl_nz=pl.col("_wl_hit") / n_cov,
+    ).with_columns(
+        wl_sd=(pl.col("_wl_sq") / n_cov - pl.col("wl_mean") ** 2).clip(0).sqrt(),
+        # Jensen gap: positive for users who buy rarely but large, ~0 for even
+        # spenders. This is exactly what separates them under a log metric.
+        wl_lumpy=(pl.col("_wl_raw") / n_cov).log1p() - pl.col("wl_mean"),
+    ).drop("_wl_sum", "_wl_sq", "_wl_raw", "_wl_hit")
+    feats = feats.join(wl, on="user_id", how="left")
+
     # lifetime stats must only look at data up to the anchor, otherwise the
     # target window would leak straight into the features
     g = (

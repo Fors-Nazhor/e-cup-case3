@@ -1,0 +1,16 @@
+{
+  "submission_v9.csv": 1.6498075828207015,
+  "submission_v9_opt.csv": 1.649315706180368,
+  "submission_v9_probe092.csv": 1.6497930886842063,
+  "submission_v9_s6.csv": 1.6499374473192272,
+  "submission_v10_top150.csv": 1.6516744440801103,
+  "probe_level.csv": 1.650959732162873,
+  "submission_v13_mix.csv": 1.6491603852320185,
+  "submission_v15_combo.csv": 1.6502417168,
+  "submission_v20_best.csv": 1.6481830314,
+  "probe_binned.csv": 1.6548697099,
+  "part_lgb.csv": 1.6505785075,
+  "part_cat.csv": 1.651537286934749,
+  "part_nn.csv": 1.657981448999588,
+  "part_two.csv": 1.6494425704143243
+}

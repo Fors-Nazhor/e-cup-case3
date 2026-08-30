@@ -106,14 +106,67 @@ def season_ratios(files: dict[date, Path]) -> dict[date, float]:
     return out
 
 
-def load_stack(anchors: list[date], files: dict[date, Path], ratios, base, deseason, tau: float = 0.0):
+# Constant within an anchor, so they identify the anchor rather than the user.
+# `anchor_ord` was already in DROP for exactly this reason; `hist_days` is
+# anchor_ord + 1 by construction and was missed. The ya_* family is 100% null
+# for every anchor before 2025-12-03 -- about three quarters of the training
+# rows -- because the window a year earlier falls before the data starts, yet
+# it is fully populated at the test anchor.
+DRIFT = ["hist_days", "ya_cov", "ya_gmv", "ya_ord", "ya_cart", "ya_days",
+         "ya_ord_days", "ya_gmv_share", "ya_vs_recent"]
+
+
+def load_stack(anchors: list[date], files: dict[date, Path], ratios, base, deseason, tau: float = 0.0,
+               top: int = 0, drop_drift: bool = False, drop_re: str = "", rule: bool = False):
     """Stack anchors into one float32 matrix, one anchor at a time.
 
     Concatenating the polars frames first would double peak memory, which at 40+
     anchors is the difference between fitting in RAM and not.
     """
     feats = [c for c in pl.read_parquet_schema(files[anchors[0]]) if c not in DROP]
-    n = sum(250_000 for _ in anchors)
+    if drop_drift:
+        n0 = len(feats)
+        feats = [c for c in feats if c not in set(DRIFT)]
+        print(f"dropped {n0 - len(feats)} drifting columns")
+    if drop_re:
+        # An audit flagged that the 365-day family is degenerate early on: data
+        # starts 2025-01-01, so at the first anchor a "365-day" sum covers the
+        # same 174 days as the 180-day one and the two columns are identical for
+        # every user. The ratio climbs to 1.75 by January and the test anchor
+        # sits at 1.80, so training does cover almost the whole range -- this
+        # flag exists to measure whether the remaining mismatch actually costs
+        # anything, rather than to assume it does.
+        import re as _re
+        pat = _re.compile(drop_re)
+        n0 = len(feats)
+        feats = [c for c in feats if not pat.search(c)]
+        print(f"dropped {n0 - len(feats)} columns matching /{drop_re}/")
+    if top:
+        # Cutting the net's inputs from 417 to the 150 highest-gain columns was
+        # the single largest gain of the project, so the same question is worth
+        # asking of the trees: feature_fraction=0.25 means every split search
+        # samples ~104 columns, and if 267 of the 417 are near-noise then most
+        # candidates at every node are junk.
+        n_all = len(feats)
+        ranked = [c for c in json.load(open(OUT / "lgb_importance.json")) if c in feats]
+        assert len(ranked) >= top, f"importance file ranks {len(ranked)} of {n_all} columns"
+        feats = ranked[:top]
+        print(f"restricted to top {top} of {n_all} features by gain")
+    # The organisers picked the 250k users for being active in three consecutive
+    # 30-day blocks ending at the data cutoff, so at the TEST anchor every user
+    # satisfies that rule by construction. At a historical anchor only 72-93% do,
+    # and the quarter that does not has a mean log1p target lower by ~0.4. Training
+    # on them means a quarter of every batch is a population that cannot appear at
+    # test. `rule` keeps only the rows that would have qualified at their anchor.
+    keep = {}
+    if rule:
+        for a_ in anchors:
+            keep[a_] = np.load(ROOT / os.environ.get("CASE3_WORK", "work") / "rule" / f"{a_}.npy")
+        n = int(sum(keep[a_].sum() for a_ in anchors))
+        print(f"rule filter: {n:,} of {250_000 * len(anchors):,} rows kept "
+              f"({n / (250_000 * len(anchors)):.1%})")
+    else:
+        n = sum(250_000 for _ in anchors)
     x = np.empty((n, len(feats)), dtype=np.float32)
     y = np.empty(n, dtype=np.float64)
     w = np.empty(n, dtype=np.float32)
@@ -122,6 +175,8 @@ def load_stack(anchors: list[date], files: dict[date, Path], ratios, base, desea
     i = 0
     for a in anchors:
         d = pl.read_parquet(files[a])
+        if rule:
+            d = d.filter(pl.Series(keep[a]))
         k = d.height
         x[i:i + k] = d.select(feats).to_numpy()
         ya = d["target"].to_numpy().astype(np.float64)
@@ -240,10 +295,17 @@ def run_val(args, files, ratios):
           f"-> relative {ratios[VAL_ANCHOR]/base:.4f}", flush=True)
 
     t0 = time.time()
-    xtr, ytr_used, wtr, atr, feats = load_stack(train_anchors, files, ratios, base, args.deseason, args.tau)
+    xtr, ytr_used, wtr, atr, feats = load_stack(train_anchors, files, ratios, base, args.deseason, args.tau,
+                                                 args.top_feats, args.drop_drift, args.drop_re,
+                                                 args.rule)
     print(f"X train {xtr.shape} ({xtr.nbytes/1e9:.2f} GB) [{time.time()-t0:.0f}s]", flush=True)
 
     va = pl.read_parquet(files[VAL_ANCHOR])
+    if args.rule_val:
+        # score on the same population the test anchor has, not on all 250k
+        va = va.filter(pl.Series(np.load(ROOT / os.environ.get("CASE3_WORK", "work")
+                                         / "rule" / f"{VAL_ANCHOR}.npy")))
+        print(f"validation restricted to {va.height:,} rule-satisfying users")
     xva = va.select(feats).to_numpy().astype(np.float32)
     yva = va["target"].to_numpy().astype(np.float64)
     sval = ratios[VAL_ANCHOR] / base
@@ -258,23 +320,41 @@ def run_val(args, files, ratios):
     # training far too early.
     yva_log = np.log1p(yva / sval) if args.deseason else np.log1p(yva)
 
+    # accept either inline JSON or a path to a JSON file; PowerShell 5.1 strips
+    # quotes when passing JSON to a native exe, so the file form is the safe one
+    if not args.fixed_rounds:
+        fixed = {}
+    elif args.fixed_rounds.lstrip().startswith("{"):
+        fixed = json.loads(args.fixed_rounds)
+    else:
+        fixed = json.load(open(args.fixed_rounds))
+    if fixed:
+        print(f"frozen round counts (no early stopping): {fixed}", flush=True)
+
     logs, iters, scores = {}, {}, {}
     for kind in args.models.split(","):
         s = time.time()
         print(f"\n=== {kind} ===", flush=True)
+        # With a frozen round count the fit helpers get no validation set, which
+        # switches early stopping off. Choosing the number of rounds on the same
+        # anchor the score is then reported on is selection on the measurement
+        # set, and it inflates every effect measured that way.
+        f = fixed.get(kind)
+        va_x, va_l = (None, None) if f else (xva, yva_log)
+        va_y = None if f else yva
         if kind == "two":
-            m = fit_twopart(xtr, ytr_used, xva, yva, sval, args.rounds, 42,
+            m = fit_twopart(xtr, ytr_used, va_x, va_y, sval, f or args.rounds, 42,
                             wtr=wtr, anchor_id=atr if args.incidence else None)
-            iters[kind] = [int(m[0].best_iteration), int(m[1].best_iteration)]
+            iters[kind] = f or [int(m[0].best_iteration), int(m[1].best_iteration)]
         elif kind == "lgb":
-            m = fit_lgb(xtr, ytr_log, xva, yva_log, args.rounds, 42, wtr=wtr)
-            iters[kind] = int(m.best_iteration)
+            m = fit_lgb(xtr, ytr_log, va_x, va_l, f or args.rounds, 42, wtr=wtr)
+            iters[kind] = f or int(m.best_iteration)
             imp = sorted(zip(feats, m.feature_importance("gain")), key=lambda z: -z[1])
             json.dump({n: float(v) for n, v in imp}, open(OUT / "lgb_importance.json", "w"))
             print("top 30:", ", ".join(f"{n}" for n, _ in imp[:30]))
         else:
-            m = fit_cat(xtr, ytr_log, xva, yva_log, args.rounds, 42, wtr=wtr)
-            iters[kind] = int(m.get_best_iteration())
+            m = fit_cat(xtr, ytr_log, va_x, va_l, f or args.rounds, 42, wtr=wtr)
+            iters[kind] = f or int(m.get_best_iteration())
         lp = raw_predict(m, xva, kind)
         logs[kind] = lp
         np.save(OUT / f"val_log_{kind}{args.tag}.npy", lp)
@@ -327,7 +407,9 @@ def run_final(args, files, ratios):
                "train_anchors": [str(a) for a in train_anchors]},
               open(OUT / "final_meta.json", "w"), indent=2)
 
-    xtr, ytr_used, wtr, atr, feats = load_stack(train_anchors, files, ratios, base, args.deseason, args.tau)
+    xtr, ytr_used, wtr, atr, feats = load_stack(train_anchors, files, ratios, base, args.deseason, args.tau,
+                                                 args.top_feats, args.drop_drift, args.drop_re,
+                                                 args.rule)
     ytr_log = np.log1p(ytr_used)
     print(f"X train {xtr.shape} ({xtr.nbytes/1e9:.2f} GB)", flush=True)
 
@@ -385,7 +467,9 @@ def run_final(args, files, ratios):
     out_path = ROOT / (f"submission_{os.environ.get('CASE3_WORK', 'work')}_raw.csv"
                        if (ROOT / "submission.csv").exists() else "submission.csv")
     sub.write_csv(out_path)
-    print(f"\nwrote {ROOT/'submission.csv'} rows={sub.height}")
+    # name the path it ACTUALLY wrote: this said submission.csv unconditionally,
+    # which reads like the guard failed and sent me chasing a phantom overwrite
+    print(f"\nwrote {out_path} rows={sub.height}")
     print(f"pred: mean={pred.mean():.3f} median={np.median(pred):.3f} "
           f"zeros={(pred<1e-6).mean():.4f} sum={pred.sum():,.0f} max={pred.max():,.1f}")
 
@@ -399,6 +483,11 @@ def main() -> None:
     ap.add_argument("--models", default="lgb")
     ap.add_argument("--seeds", type=int, default=1)
     ap.add_argument("--deseason", type=int, default=1)
+    ap.add_argument("--fixed-rounds", default="",
+                    help="JSON like {\"lgb\":360,\"cat\":240,\"two\":[450,340]}. "
+                         "Disables early stopping on the evaluation anchor -- "
+                         "picking the round count there and then reporting the "
+                         "score there is selection on the measurement set")
     ap.add_argument("--incidence", type=int, default=1,
                     help="per-anchor logit offset for the two-part classifier")
     ap.add_argument("--tag", default="",
@@ -409,6 +498,21 @@ def main() -> None:
                          "not specific to 2026-01-14")
     ap.add_argument("--tau", type=float, default=0.0,
                     help="exponential half-life in days for anchor recency weighting; 0 = off")
+    # Separated deliberately: to tell whether matching the TRAINING population to
+    # the test one helps, both arms must be scored on the same evaluation
+    # population -- otherwise the two changes are confounded.
+    ap.add_argument("--rule", type=int, default=0,
+                    help="filter TRAINING rows to users who satisfied the "
+                         "organisers' 3-block activity rule at their anchor")
+    ap.add_argument("--rule-val", type=int, default=0,
+                    help="restrict the VALIDATION set to rule-satisfying users, "
+                         "which is the population the test anchor actually has")
+    ap.add_argument("--drop-re", default="",
+                    help="regex; drop every feature whose name matches")
+    ap.add_argument("--drop-drift", type=int, default=0,
+                    help="drop anchor-identifier and year-ago columns (see DRIFT)")
+    ap.add_argument("--top-feats", type=int, default=0,
+                    help="keep only the N highest-gain columns (needs lgb_importance.json)")
     ap.add_argument("--anchor-step", type=int, default=1,
                     help="use every k-th anchor; anchors sit ~4-5 days apart, so"
                          " k=3 restores a ~14-day stride and drops near-duplicates")

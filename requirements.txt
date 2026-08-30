@@ -4,7 +4,7 @@ polars>=1.30
 pyarrow>=18
 lightgbm>=4.5
 catboost>=1.2
-scikit-learn>=1.5
+scipy>=1.14        # BG/NBD: оптимизация правдоподобия и hyp2f1
 
 # Optional GPU branch: temporal CNN on an AMD Radeon (RDNA4 / gfx1201) via ROCm.
 # Install separately, it is not on PyPI:
